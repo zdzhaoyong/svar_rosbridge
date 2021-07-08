@@ -1,0 +1,15 @@
+*~
+*.o
+build*
+build-*
+libs
+bin
+*.user
+*.pro.user*
+cmake-build-debug
+.idea
+CMakeLists.txt.user*
+__pycache__
+.vs
+android-build
+debug
