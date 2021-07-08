@@ -14,7 +14,7 @@ using namespace GSLAM;
 
 class ROSSubscriber{
 public:
-    ROSSubscriber(std::string topic,sv::Svar func,sv::Svar config)
+    ROSSubscriber(std::string topic,sv::Svar func,sv::Svar config=sv::Svar())
         : config(config),topic(topic),client(config.get<std::string>("url","localhost:9090")){
         sv::Svar msg=
         { {"op", "subscribe"},
@@ -36,12 +36,12 @@ public:
         client.on_message=[this,func](std::shared_ptr<WsClient::Connection>, std::shared_ptr<WsClient::InMessage> msg){
             auto compression=this->config.get<std::string>("compression","json");
             if(compression=="json")
-                func(sv::Svar::parse_json(msg->string()));
+                func(sv::Svar::parse_json(msg->string())["msg"]);
             else if(compression=="cbor-raw"||compression=="cbor"){
                 std::string str=msg->string();
                 try{
                     sv::Svar obj=svar["serializers"]["cbor"].call("load",sv::SvarBuffer(str.data(),str.size()));
-                    func(obj);
+                    func(obj["msg"]);
                 }
                 catch(...){
                     LOG(ERROR)<<"Failed to parse cbor with size "<<str.size();
@@ -70,7 +70,7 @@ public:
 
 class ROSPublisher{
 public:
-    ROSPublisher(std::string topic,sv::Svar config)
+    ROSPublisher(std::string topic,sv::Svar config=sv::Svar())
         : topic(topic),config(config),
           client(config.get<std::string>("url","localhost:9090")),
           url(config.get<std::string>("url","localhost:9090")){
@@ -98,7 +98,7 @@ public:
                     };
 
         if(config.exist("id"))   op["id"]=config["id"];
-        auto str=op.dump_json();
+        auto str = op.dump_json();
         client.on_open=[this,str](std::shared_ptr<WsClient::Connection> connection){
             connection->send(str);
             connection->send_close(1000);
@@ -124,23 +124,100 @@ public:
     std::string url;
 };
 
-void callback_msg(sv::Svar msg){
-    LOG(INFO)    <<"Received "<<msg;
-}
+class ServiceCaller{
+public:
+    ServiceCaller(std::string name,sv::Svar args,sv::Svar config=sv::Svar())
+        : topic(name),config(config),client(config.get<std::string>("url","localhost:9090")){
+        sv::Svar msg=
+        { {"op", "call_service"},
+          {"service",topic}
+        };
 
-int main(int argc,char** argv){
-    std::string url="localhost:9090";
-    ROSSubscriber sub(url,{{"topic","/camera/fisheye1/image_raw"},
-                           {"compression","json"}},callback_msg);
-    ROSSubscriber sub1(url,{{"topic","/ztopic"}},callback_msg);
+        if(config.exist("id"))   msg["id"]=config["id"];
+        if(config.exist("fragment_size")) msg["fragment_size"]=config["fragment_size"];
+        msg["args"] = args;
 
-    ROSPublisher  pub(url,{{"topic","/ztopic"},{"type","std_msgs/String"}});
+        client.on_open=[this,msg](std::shared_ptr<WsClient::Connection> connection){
+            connection->send(msg.dump_json());
+        };
 
-    for(int i=0;i<10000;i++){
-        pub.publish({{"data","hello"}});
-        usleep(10000);
+        client.on_message=[this](std::shared_ptr<WsClient::Connection>, std::shared_ptr<WsClient::InMessage> msg){
+            sv::Svar response=sv::Svar::parse_json(msg->string());
+            result.set_value(response);
+        };
+        work_thread=std::thread([this](){client.start();});
     }
+
+    sv::Svar wait_result(){
+        sv::Svar ret=result.get_future().get();
+        client.stop();
+        return ret;
+    }
+
+    ~ServiceCaller(){
+        while (!work_thread.joinable()) {
+            usleep(1000);
+        }
+        work_thread.join();
+    }
+
+    std::string topic;
+    sv::Svar    config;
+    WsClient    client;
+    std::thread work_thread;
+    std::promise<sv::Svar> result;
+};
+
+sv::Svar call_service(std::string name,sv::Svar args,sv::Svar config=sv::Svar()){
+    return ServiceCaller(name,args,config).wait_result();
 }
+
+class ROSService{
+public:
+    ROSService(std::string name,sv::Svar func,sv::Svar config=sv::Svar())
+        : config(config),topic(name),client(config.get<std::string>("url","localhost:9090")){
+        sv::Svar msg=
+        { {"op", "advertise_service"},
+          {"service",topic}
+        };
+
+        if(config.exist("type")) msg["type"]=config["type"];
+
+        client.on_open=[this,msg](std::shared_ptr<WsClient::Connection> connection){
+            connection->send(msg.dump_json());
+            this->connection=connection;
+        };
+
+        client.on_message=[this,func](std::shared_ptr<WsClient::Connection> connection, std::shared_ptr<WsClient::InMessage> msg){
+            auto res=sv::Svar::parse_json(msg->string());
+            sv::Svar ret=func(res["args"]);
+            sv::Svar response=
+            { {"op", "service_response"},
+              {"service",topic},
+              {"result",true},
+              {"values",ret},
+              {"id",res["id"]}
+            };
+
+            LOG(INFO)<<response;
+            connection->send(response.dump_json());
+        };
+        work_thread=std::thread([this](){client.start();});
+    }
+
+    ~ROSService(){
+        sv::Svar msg={{ "op", "unadvertise_service"},
+                      {"service",topic}};
+        client.stop();
+        work_thread.join();
+    }
+
+    std::string topic;
+    sv::Svar config;
+    WsClient client;
+    std::shared_ptr<WsClient::Connection> connection;
+    std::thread work_thread;
+};
 
 //class ROSBridgeService{
 //public:
@@ -187,11 +264,18 @@ int main(int argc,char** argv){
 
 REGISTER_SVAR_MODULE(nsq){
     Class<ROSSubscriber>("ROSSubscriber")
-            .unique_construct<std::string,Svar,Svar>();
+            .unique_construct<std::string,Svar,Svar>()
+            .unique_construct<std::string,Svar>();
 
     Class<ROSPublisher>("ROSPublisher")
+            .unique_construct<std::string>()
             .unique_construct<std::string,Svar>()
             .def("publish",&ROSPublisher::publish);
+
+    svar["call_service"] = call_service;
+
+    Class<ROSService>("ROSService")
+            .unique_construct<std::string,Svar,Svar>();
 
 //    Class<ROSBridgeService>("ROSBridgeService")
 //            .unique_construct<Svar>();
